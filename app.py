@@ -3,19 +3,11 @@ from flask import Flask, request, jsonify
 import nemo.collections.asr as nemo_asr
 import torch
 import gc
-import os
-import sys
 import time
 import logging
 import subprocess
-import difflib
-import soundfile as sf
-import librosa
-import numpy as np
 import pandas as pd, json
-from pathlib import Path 
 from segment import (
-    segment_audio,
     frame_segment_audio,
     SegmentDataset
 )
@@ -29,9 +21,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import HuggingFacePipeline
 from langchain.chains import RetrievalQA
 
-from nemo.collections.asr.parts.utils.vad_utils import (
-    prepare_manifest,
-)
+
 from nemo.collections.asr.parts.utils.manifest_utils import (
     create_manifest
 )
@@ -60,7 +50,7 @@ print("Загрузка модели...")
 model_name = "stt_ru_conformer_ctc_large.nemo"
 try:
     logger.info(f"Загрузка модели {model_name}...")
-    asr_model = nemo_asr.models.ASRModel.restore_from(model_name, map_location=device)
+    asr_model = nemo_asr.models.ASRModel.restore_from(f"models/asr/{model_name}", map_location=device)
     # asr_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(model_name).cpu()   
     # asr_model.eval()
     # logger.info(f"Модель загружена на {device}")
@@ -107,17 +97,10 @@ def transcribe():
 
         # Выполняем транскрипцию
         with torch.no_grad():
-            # segments = nemo_segment_audio(
-            #     file_path,
-            #     segment_duration=10.0,
-            #     overlap=1.5,
-            #     target_sr=16000
-            # )
-            logger.info(os.getcwd())
-            # config_path = "config/vad_inference_postprocessing.yaml"
+
             config_path = "config/vad_inference_frame.yaml"
             vad_in_manifest = "/app/config/vad_in_manifest.json"
-            vad_out_manifest = "/app/config/vad_out_manifest.json"
+            # vad_out_manifest = "/app/config/vad_out_manifest.json"
 
             create_manifest(
                 wav_path = "config/wav_paths.txt",
@@ -133,8 +116,6 @@ def transcribe():
             segTable = pd.read_csv("output/vad_frame/rttm_preds/sample.txt", delim_whitespace=True, names=["start", "duration", "label"])
             segTable = segTable[segTable["label"] == "speech"]     # keep only speech
 
-           
-
             audio_queries = []
             for _, row in segTable.iterrows():
                 audio_queries.append({
@@ -145,49 +126,11 @@ def transcribe():
             ds = SegmentDataset(file_path, audio_queries)
             dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
-            # for start_sec, end_sec, segment in segments:
-            #     print(f"Обработка сегмента: {start_sec:.1f}-{end_sec:.1f} сек")
-                
-            #     # Получение сэмплов
-            #     samples = segment.samples
-            #     print(np.array(samples).shape)
-               
-            #     # print(np.array(samples).shape)
-            #     # Преобразование в тензор [batch, time]
-            #     audio_tensor = torch.tensor(samples).unsqueeze(0).float()
-
-            #        # Convert to NumPy array
-            #     # numpy_array = tensor_data.numpy()
-
-            #     # Now, you can serialize the NumPy array (or a dictionary containing it)
-            #     data_to_serialize = {"my_tensor_data": samples.tolist()} # Convert to list for JSON
-                
-            #     return jsonify(data_to_serialize)
-
-            #     # audio_tensor = prepare_audio_tensor(samples)
-
-                
-            #     # Транскрипция
-            #     text = asr_model.transcribe(audio_tensor)[0]
-                
-            #     # Сохранение результата с временными метками
-            #     transcripts.append({
-            #         "start": start_sec,
-            #         "end": end_sec,
-            #         "text": text
-            #     })
-                
-            #     # Очистка памяти
-            #     del audio_tensor, samples
-            #     torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
             transcripts = []
             transcription_text = ""
 
             for audio_tensor, meta in dl:
-                # audio_tensor: shape [1, N_samples], dtype float32
                 audio_np = audio_tensor.squeeze(0).numpy()
-     
                 hyps = asr_model.transcribe(
                     audio_np, 
                     batch_size=1,
@@ -219,14 +162,14 @@ def transcribe():
         logger.info(f"Транскрипция завершена за {time.time()-start_time:.2f} сек")
 
         # Логируем результат
-        with open("/app/output/output.txt", "w") as f:
+        with open("/tmp/output.txt", "w") as f:
             f.write(f"{transcription_text}")
 
         print("transcripts")
         for tr in transcripts:
             print(tr)
 
-        with open("/app/output/output.json", "w", encoding="utf-8") as f:
+        with open("/tmp/output.json", "w", encoding="utf-8") as f:
             f.write(json.dumps(transcripts, ensure_ascii=False))
         print("Результат записан в output.json")
         # return jsonify({"transcription": str(transcription_text)})
@@ -265,122 +208,6 @@ def qa():
     # 4. Задаём вопрос
     print(qa.run(query))
 
-def nemo_segment_audio(
-    file_path, 
-    segment_duration=30.0, 
-    overlap=1.0, 
-    target_sr=16000
-):
-    """
-    Сегментирует аудиофайл с преобразованием в моно и понижением частоты
-    
-    :param file_path: путь к аудиофайлу
-    :param segment_duration: длительность сегмента в секундах
-    :param overlap: перекрытие между сегментами в секундах
-    :param target_sr: целевая частота дискретизации
-    :return: список кортежей (начало, конец, AudioSegment)
-    """
-    # Загрузка аудио с конвертацией в моно
-    signal, orig_sr = sf.read(file_path)
-    
-    # Преобразование в моно
-    if signal.ndim > 1:
-        signal = signal.squeeze()  # Удаление избыточной размерности
-    
-    # Понижающая дискретизация
-    if orig_sr != target_sr:
-        signal = librosa.resample(signal, orig_sr=orig_sr, target_sr=target_sr)
-        sample_rate = target_sr
-    else:
-        sample_rate = orig_sr
-    
-    # Рассчет параметров сегментации
-    total_duration = len(signal) / sample_rate
-    segment_samples = int(segment_duration * sample_rate)
-    step_samples = int((segment_duration - overlap) * sample_rate)
-    
-    # Создание сегментов
-    segments = []
-    start_sample = 0
-    
-    while start_sample < len(signal):
-        end_sample = start_sample + segment_samples
-        
-        # Обработка последнего сегмента
-        if end_sample > len(signal):
-            end_sample = len(signal)
-        
-        # Извлечение сегмента сигнала
-        segment_signal = signal[start_sample:end_sample]
-        
-        # Создание AudioSegment
-        segment = AudioSegment(
-            samples=segment_signal,
-            sample_rate=sample_rate,
-            target_sr=target_sr,
-            duration=len(segment_signal) / sample_rate,
-            offset=start_sample / sample_rate,
-            orig_sr=orig_sr
-        )
-        
-        # Добавление в результат
-        segments.append((
-            start_sample / sample_rate,  # начало в секундах
-            end_sample / sample_rate,    # конец в секундах
-            segment
-        ))
-        
-        # Переход к следующему сегменту
-        start_sample += step_samples
-        
-        # Остановка если достигнут конец
-        if start_sample >= len(signal):
-            break
-    
-    return segments
-
-
-    # signal, sr = librosa.load(file_path, sr=16000, mono=True)
-    
-    # Создание временного манифеста
-    manifest = [{
-        "audio_filepath": file_path,
-        "duration": librosa.get_duration(file_path),
-        "text": ""  # Текст не нужен для транскрипции
-    }]
-
-    # Создание сегментов
-    segmented_manifest = create_segments(
-        manifest=manifest,
-        segment_duration=60.0,
-        step_duration=58.5,  # 60 - 1.5 overlap
-        min_segment_duration=1.0,
-        output_dir="temp_segments",
-    )
-
-    for entry in segmented_manifest:
-        segment_path = entry[file_path]
-        transcription = asr_model.transcribe([segment_path])[0]
-        transcripts.append(transcription)
-
-        
-        for i, seg in enumerate(segments):
-            # Добавление размерности батча
-            seg_tensor = torch.tensor(seg).unsqueeze(0)
-            transcripts = []
-
-            # transcription = asr_model.transcribe(seg_tensor, channel_selector=0)
-            if seg_tensor.dim() == 3:
-                print("Конвертация стерео в моно...")
-                seg_tensor = seg_tensor.mean(dim=2) if seg_tensor.size(2) > 1 else seg_tensor[:, :, 0]
-            
-            text = model.transcribe(seg_tensor)[0]
-            transcripts.append(text)
-            # Очистка памяти
-            # del seg_tensor
-            # torch.cuda.empty_cache() if torch.cuda.is_available() else Non
-        return " ".join(transcripts)
-
 def auto_convert_audio(file_path, output_path):
     """Конвертирует любой формат в WAV 16kHz mono"""
 
@@ -402,103 +229,6 @@ def auto_convert_audio(file_path, output_path):
         raise RuntimeError(f"Ошибка конвертации: {error_msg}") from e
     
     return output_path
-
-def combine_segments_with_overlap(results, min_overlap_words=3, max_overlap_words=5, similarity_threshold=0.8):
-    """
-    Склеивает результаты транскрипции сегментов с учетом перекрытия
-    
-    :param results: список словарей [{"start": float, "end": float, "text": str}, ...]
-    :param min_overlap_words: минимальное количество слов для поиска в перекрытии
-    :param max_overlap_words: максимальное количество слов для поиска в перекрытии
-    :param similarity_threshold: порог схожести для совпадения фраз
-    :return: склеенный текст
-    """
-    if not results:
-        return ""
-    
-    full_text = results[0]['text']
-    prev_text = full_text
-    
-    for i in range(1, len(results)):
-        current = results[i]
-        current_text = current['text']
-        
-        # Разбиваем тексты на слова
-        prev_words = prev_text.split()
-        curr_words = current_text.split()
-        
-        # Определяем диапазон поиска перекрытия
-        search_range = range(min_overlap_words, min(max_overlap_words, len(prev_words), len(curr_words)) + 1)
-        
-        # Поиск оптимального перекрытия
-        best_match = None
-        best_similarity = 0
-        
-        for n in search_range:
-            if n > len(prev_words) or n > len(curr_words):
-                continue
-                
-            # Берем последние n слов предыдущего текста
-            prev_overlap = " ".join(prev_words[-n:])
-            # Берем первые n слов текущего текста
-            curr_overlap = " ".join(curr_words[:n])
-            
-            # Рассчитываем схожесть
-            similarity = difflib.SequenceMatcher(
-                None, prev_overlap.lower(), curr_overlap.lower()
-            ).ratio()
-            
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_match = (n, prev_overlap, curr_overlap)
-        
-        # Обработка найденного перекрытия
-        if best_match and best_similarity >= similarity_threshold:
-            n, prev_phrase, curr_phrase = best_match
-            # Добавляем только неперекрывающуюся часть
-            remaining_text = " ".join(curr_words[n:])
-            
-            # Для отладки можно выводить информацию о склейке
-            print(f"🔗 Обнаружено перекрытие {n} слов: "
-                  f"«{prev_phrase}» → «{curr_phrase}» "
-                  f"(сходство: {best_similarity:.2f})")
-            
-            full_text += " " + remaining_text
-        else:
-            # Если перекрытие не найдено, добавляем весь текст
-            full_text += " " + current_text
-            if best_match:
-                print(f"⚠️ Низкое сходство ({best_similarity:.2f}): "
-                      f"«{best_match[1]}» vs «{best_match[2]}»")
-        
-        prev_text = current_text
-    
-    return full_text.strip()
-
-def prepare_audio_tensor(audio_data):
-    """
-    Преобразует аудио данные в правильный формат для модели
-    :param audio_data: аудио данные (numpy array или tensor)
-    :return: тензор в формате [batch, time]
-    """
-    # Преобразование в тензор PyTorch, если необходимо
-    if not isinstance(audio_data, torch.Tensor):
-        audio_tensor = torch.tensor(audio_data)
-    else:
-        audio_tensor = audio_data
-    
-    # Проверка и исправление размерности
-    if audio_tensor.dim() == 1:  # [time]
-        audio_tensor = audio_tensor.unsqueeze(0)  # [1, time]
-    elif audio_tensor.dim() == 3:  # [batch, channels, time]
-        # Убираем размерность каналов
-        audio_tensor = audio_tensor.squeeze(1)  # [batch, time]
-    elif audio_tensor.dim() == 2 and audio_tensor.size(0) != 1:
-        # Если размерность [time, channels], транспонируем
-        audio_tensor = audio_tensor.transpose(0, 1)
-        audio_tensor = audio_tensor.squeeze(1)  # [batch, time]
-    
-    return audio_tensor.float()
 
 def capitalize_text(text, last_sent = False):
     if not text.strip():  # Проверка на пустую строку или пробелы
