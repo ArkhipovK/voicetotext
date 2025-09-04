@@ -1,0 +1,4 @@
+Flask
+nemo_toolkit[asr]
+pybind11
+huggingface_hub[hf_xet]

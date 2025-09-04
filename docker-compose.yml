@@ -1,0 +1,18 @@
+version: "3"
+services:
+  voicetoreport-local:
+    image: voicetoreport-local
+    shm_size: 2G
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 5G
+    volumes:
+      - C:\Users\Admin\Projects\voicetoreport\voicetotext:/app
+      - C:\Users\Admin\Projects\voicetoreport\artefacts:/tmp
+    ports:
+      - 5000:5000
+    command: ["python","app.py"]
+    

@@ -1,0 +1,47 @@
+num_workers: 0
+sample_rate: 16000
+gen_seg_table: True
+write_to_manifest: True
+batch_size: 1
+
+prepare_manifest:
+  auto_split: false
+  split_duration: 120           # 2-minute chunks → safe for 8-16 GB RAM
+  split_overlap: 0.2            # no overlap between chunks
+  
+# CPU-friendly VAD inference + post-processing
+vad:
+  model_path: "nvidia/frame_vad_multilingual_marblenet_v2.0"   # or any other .nemo checkpoint
+  use_rttm: false
+  parameters:
+    # Audio front-end
+    sample_rate: 16000
+    window_length_in_sec: 0.025
+    shift_length_in_sec: 0.02
+    normalize_audio_db: False
+
+    # Smoothing
+    smoothing: false
+    overlap: 0.875
+
+    # ── CPU-only settings ───────────────────────────────
+    device: "cpu"
+    batch_size: 1          # 1 = longest possible window, lowest RAM use
+    num_workers: 0         # disables multiprocessing on CPU
+
+    # ── Post-processing thresholds ─────────────────────
+    postprocessing:
+      onset: 0.85
+      offset: 0.8
+      pad_onset: 0.05
+      pad_offset: 0.04
+      min_duration_on: 0.4
+      min_duration_off: 0.01
+      filter_speech_first: false
+
+# I/O
+dataset: null              # will be overridden by CLI argument
+frame_out_dir: "/app/output/vad_frame" # where raw frame-level logits are saved
+rttm_out_dir: "./output/vad_table"
+out_manifest_filepath: null
+evaluate: false
